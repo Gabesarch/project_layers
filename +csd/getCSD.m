@@ -88,7 +88,7 @@ for shankInd = 1:numShanks
     curShankInds = shankInd*lenShanks-lenShanks+1:shankInd*lenShanks;
     
     % event-triggered LFP
-    [sta,~, time] = eventTriggeredAverage(lfp.data(:,curShankInds), ev(:), ip.Results.window);
+    [sta,~, time] = pdsa.eventTriggeredAverage(lfp.data(:,curShankInds), ev(:), ip.Results.window);
     
     if exclude
         curDeadChan = excChan(excChan>=curShankInds(1)&excChan<=curShankInds(end));
@@ -222,7 +222,11 @@ for shankInd = 1:numShanks
         % find reversal point
         CSD_ = CSD(:,ix);
         reversalPoints = findZeroCrossings(CSD_(:,timeIndex));
-        stats.reversalPointDepth{shankInd} = reversalPoints(1);
+        if isempty(reversalPoints)
+            stats.reversalPointDepth{shankInd} = NaN;
+        else
+            stats.reversalPointDepth{shankInd} = reversalPoints(1);
+        end
         
         continue
         %return
