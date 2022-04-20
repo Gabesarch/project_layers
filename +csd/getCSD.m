@@ -19,6 +19,11 @@ function stats = getCSD(lfp, eventTimes, varargin)
 %                                      interpolate to get them
 %   'spatsmooth'     double          - apply spatial smoothing to sta
 %                                      before computing CSD
+%   'noisetype'      int             - noisetype = 3 is full field flashing 
+%                                      noisetype = 6 is moving flashing
+%                                      (for MT)
+%                                    - noisetype = 'saccade' saccade locked
+%                                      CSD
 %
 % valid csd methods:
 %       'standard' - second spatial derivative
@@ -35,11 +40,24 @@ ip.addParameter('plotIt', true)
 ip.addParameter('method', 'standard')
 ip.addParameter('sampleRate', 1000)
 ip.addParameter('exclude', true)
-ip.addParameter('spatsmooth', 2.5)
+ip.addParameter('spatsmooth', 1.0)
+ip.addParameter('tempsmooth', 0.0)
+ip.addParameter('noisetype', 3) % 3,6 are stimulus conditions, saccade3,saccade6 are saccade locked to 3 and 6
+ip.addParameter('startSearch', 3)
+ip.addParameter('rvsl_window', [40 60])
+ip.addParameter('sink_first', true)
+ip.addParameter('do_spectrogram', false)
+
+% subtract off "baseline" spatial average vector?
+ip.addParameter('subtract_pre_CSD', false)
+ip.addParameter('subtract_pre_CSD_time0', -100)
+ip.addParameter('subtract_pre_CSD_time1', 0)
+
 ip.parse(varargin{:});
 
 exclude = ip.Results.exclude;
 excChan = lfp.deadChan;
+rvsl_window = ip.Results.rvsl_window;
 
 if isempty(eventTimes)
     stats = struct();
@@ -59,11 +77,26 @@ if isempty(eventTimes)
     return
 end
 
+noisetype = ip.Results.noisetype;
+noisetype = string(noisetype);
+
 if isa(eventTimes, 'double')
     eventTimes = eventTimes(:);
 elseif isa(eventTimes, 'struct') % Get CSD event times (if not already input)
-    eventTimes = csd.getCSDEventTimes(eventTimes);
-    eventTimes = eventTimes(:);
+    
+    switch noisetype
+        case {'3','6'}
+            eventTimes = csd.getCSDEventTimes(eventTimes, double(noisetype));
+            eventTimes = eventTimes(:);
+        case 'saccade3'
+            eventTimes = csd.getSaccadeEventTimes(eventTimes, 3);
+            eventTimes = eventTimes(:);
+        case 'saccade6'
+            eventTimes = csd.getSaccadeEventTimes(eventTimes, 6);
+            eventTimes = eventTimes(:);
+        otherwise
+            error('Dont know noisetype input... Please check noisetype input')
+    end
 else
     error('eventTimes input must be double or struct')
 end
@@ -71,6 +104,9 @@ end
 if isempty(eventTimes)
     error('eventTimes empty')
 end
+
+% hack to remove non-decreasing values
+% lfp.timestamps = lfp.timestamps(diff(lfp.timestamps)>0);
 
 [~,~,ev] = histcounts(eventTimes, lfp.timestamps); % convert time to samples
 
@@ -82,13 +118,38 @@ end
 
 numShanks = size(ch0_all, 2); % number of shanks
 lenShanks = size(ch0_all, 1); % number of channels on each shank
+spacing = mode(abs(diff(ch0_all)));
 for shankInd = 1:numShanks
     ch0 = ch0_all(:,shankInd);
+    spacing_ = spacing(shankInd);
     
     curShankInds = shankInd*lenShanks-lenShanks+1:shankInd*lenShanks;
     
     % event-triggered LFP
-    [sta,~, time] = pdsa.eventTriggeredAverage(lfp.data(:,curShankInds), ev(:), ip.Results.window);
+    if ip.Results.do_spectrogram
+        [sta,~, time,~, ~, samps] = pdsa.eventTriggeredAverage(lfp.data(:,curShankInds), ev(:), ip.Results.window);
+        pss = NaN(size(samps,1),17,size(samps,3));
+        for s=1:size(samps,1)
+            for ch=1:size(samps,3)
+                samp = squeeze(samps(s,:,ch));
+                [~,f,t,ps] = spectrogram(samp,32,16,32,lfp.info.sampleRate); %spectrogram(samp,64,32,64,lfp.info.sampleRate);
+                ps = ps(f>60,:);
+                ps = nanmean(ps, 1);
+                pss(s,:,ch) = ps;
+            end
+        end
+        pss = squeeze(nanmean(pss,1));
+        pss(isnan(pss)) = 0;
+        stats.spectrogram(:,:,shankInd) = pss;
+%         stats.spectrogram(shankInd) = pss;
+    else
+       [sta,~, time,~, ~] = pdsa.eventTriggeredAverage(lfp.data(:,curShankInds), ev(:), ip.Results.window);
+       if ip.Results.spatsmooth==0
+           disp('spatial smoothing is 0')
+       end
+    end
+%     figure()
+%     imagesc(time, ch0, pss)
     
     if exclude
         curDeadChan = excChan(excChan>=curShankInds(1)&excChan<=curShankInds(end));
@@ -96,9 +157,16 @@ for shankInd = 1:numShanks
         
         for indDChan = 1:length(curDeadChan)% interpolate dead channels
             DChan = curDeadChan(indDChan);
-            abovebelow = [sta(:,DChan-1) sta(:,DChan+1)];
-            vq = interp1(abovebelow',1.5, 'linear');
-            sta(:,DChan) = vq;
+            if DChan==lenShanks || ismember(DChan+1, curDeadChan)
+                sta(:,DChan) = sta(:,DChan-1);
+            elseif DChan==1
+                sta(:,DChan) = sta(:,DChan+1);
+            else
+%                 disp(DChan)
+                abovebelow = [sta(:,DChan-1) sta(:,DChan+1)];
+                vq = interp1(abovebelow',1.5, 'linear');
+                sta(:,DChan) = vq;
+            end
         end
         
     end
@@ -115,19 +183,22 @@ for shankInd = 1:numShanks
             CSD = csd.splineCSD(sta', 'el_pos', ch0);
         case 'standard'
             
-            ip.Results.spatsmooth
+%             ip.Results.spatsmooth
             
-            sta = -1.*sta;
+%             sta = -1.*sta;
             
             % scale smoothing for different channel distances
-            smoothAmt = ip.Results.spatsmooth*(50/abs(lfp.ycoords(1)-lfp.ycoords(2)));
             
+%             
             %spatial smoothing
             if ip.Results.spatsmooth > 0
+                % first scale to 50 micron electrode
+                smoothAmt = ip.Results.spatsmooth*(50/abs(lfp.ycoords(1)-lfp.ycoords(2)));
                 for t = 1:size(sta,1)
                     sta(t,:) = imgaussfilt(sta(t,:), smoothAmt);
                 end
             end
+            
             
             %             % spatial smoothing
             %             if ip.Results.spatsmooth > 0
@@ -136,17 +207,27 @@ for shankInd = 1:numShanks
             %                 end
             %             end
             %
-            %             % temporal smoothing
-            %             if ip.Results.tempsmooth > 0
-            %                 for ch = 1:size(sta,2)
-            %                     sta(:,ch) = smooth(sta(:,ch),11,'sgolay');
-            %                 end
-            %             end
+            % temporal smoothing
+            if ip.Results.tempsmooth > 0
+                for ch = 1:size(sta,2)
+%                     sta(:,ch) = smooth(sta(:,ch),11,'sgolay');
+                    sta(:,ch) = imgaussfilt(sta(:,ch), ip.Results.tempsmooth);
+                end
+            end
             
-            
+            CSD = repmat(NaN,size(sta,1),size(sta,2));
+            conductivity = 1;
+            for ii = 1:size(sta,1) % obtaines the CSD
+                for i = 2:size(sta,2)-1 % 2nd to 2nd last electode
+                    % traditional CSD equation
+                    CSD(ii,i) = -(((sta(ii,i+1) - 2*sta(ii,i) + sta(ii,i-1) )));%...
+                        %/ (spacing_^2))*conductivity); 
+                end
+            end
+            CSD = CSD';
             
             % compute CSD
-            CSD = diff(sta, 2, 2)';
+%             CSD = diff(sta, 2, 2)';
             %             CSD = csd.standardCSD(sta', 'el_pos', ch0);
             
             %             % remove first and last depth since CSD takes derivative twice
@@ -166,32 +247,32 @@ for shankInd = 1:numShanks
     %     imagesc(CSD');
     
     
-    tpower = std(CSD).^4.*-1;
-    ix = time < 0;
-    
-    tpower = imgaussfilt(tpower, 3);
-    
-    tpower = fix(tpower/ (10*max(tpower(ix))));
-    %     plot(tpower)
-    
-    dpdt = diff(tpower);
-    
-    inds = find(sign(dpdt)~=0); % remove indices that don't have a sign
-    
-    zc = find(diff(sign(dpdt))==-2);
-    [~, ind] = sort(tpower(zc), 'descend');
-    
-    if length(zc) >= 3
-        numP = 3;
-    else
-        numP = length(zc);
-    end
-    
-    %numP = 3;
-    
-    %zc = sort(zc(ind(1:numP))); % three biggest peaks in order
-    
-    zc = sort(zc(ind(1:min(numel(ind), 3))));
+%     tpower = std(CSD).^4.*-1;
+%     ix = time < 0;
+%     
+%     tpower = imgaussfilt(tpower, 3);
+%     
+%     tpower = fix(tpower/ (10*max(tpower(ix))));
+%     %     plot(tpower)
+%     
+%     dpdt = diff(tpower);
+%     
+%     inds = find(sign(dpdt)~=0); % remove indices that don't have a sign
+%     
+%     zc = find(diff(sign(dpdt))==-2);
+%     [~, ind] = sort(tpower(zc), 'descend');
+%     
+%     if length(zc) >= 3
+%         numP = 3;
+%     else
+%         numP = length(zc);
+%     end
+%     
+%     %numP = 3;
+%     
+%     %zc = sort(zc(ind(1:numP))); % three biggest peaks in order
+%     
+%     zc = sort(zc(ind(1:min(numel(ind), 3))));
     
     ch00 = ch0;
     if strcmp(ip.Results.method, 'spline')
@@ -199,7 +280,24 @@ for shankInd = 1:numShanks
         ch0 = ch0(:,1);
     end
     
-    if isempty(zc)
+    if ip.Results.subtract_pre_CSD
+        % subtract off spatial average vector
+        time0 = ip.Results.subtract_pre_CSD_time0;
+        time1 = ip.Results.subtract_pre_CSD_time1;
+        where_0 = find(time==time0);
+        where_1 = find(time==time1);
+        if isempty(where_0) || isempty(where_1)
+            error('Could not find time range')
+        end
+        csdonehund_csd = CSD(:,where_0:where_1, :);
+        time_avg_saccade_csd = mean(csdonehund_csd, 2);
+
+        avg_adjusted_csd = CSD - time_avg_saccade_csd;
+        %stats_ = stats;
+        CSD = avg_adjusted_csd;
+    end
+    
+    if (1) %isempty(zc)
         stats.STA(:,:,shankInd) = sta';
         stats.CSD(:,:,shankInd) = CSD;
         stats.time  = time;
@@ -208,24 +306,75 @@ for shankInd = 1:numShanks
         stats.chUp  = ch0;
         stats.numShanks = numShanks;
         stats.latency = nan;
-        stats.sinkDepth(shankInd) = nan;
+%         stats.sinkDepth(shankInd) = nan;
         stats.sourceDepth(shankInd) = nan;
         stats.sinkChannel(shankInd) = nan;
         stats.sourceChannel(shankInd) = nan;
         
         % try to locate using other method
-        ix = time > 0 & time < 100;
-        % sink should be the minimum value
-        [~,id] = min(reshape(CSD(:,ix), [], 1));
+%         ix = time > 60 & time < 150;
+%         if ip.Results.noisetype==6
+%             ix = time > 50 & time < 150;
+%             % here we want source
+%             [~,id] = max(reshape(-CSD(:,ix), [], 1));
+%         else
+%             ix = time > 50 & time < 80;
+%             % sink should be the minimum value
+%             [~,id] = max(reshape(CSD(:,ix), [], 1));
+%         end
+        if noisetype=='6'
+            ix = time > rvsl_window(1) & time < rvsl_window(2);
+            % here we want source
+            [~,id] = max(reshape(-CSD(:,ix), [], 1));
+        elseif ip.Results.sink_first
+            time1 = rvsl_window(1);
+            time2 = rvsl_window(2);
+            ix = time > time1 & time < time2;
+            % sink should be the minimum value
+            [~,id] = max(reshape(-CSD(:,ix), [], 1));
+        else
+            time1 = rvsl_window(1);
+            time2 = rvsl_window(2);
+            ix = time > time1 & time < time2;
+            % sink should be the minimum value
+            [~,id] = max(reshape(CSD(:,ix), [], 1));
+        end
+        
         % convert to indices
         [depthIndex,timeIndex] = ind2sub(size(CSD(:,ix)), id);
+        
+        time_ = time(ix);
+        sinkTime = time_(timeIndex);
         % find reversal point
         CSD_ = CSD(:,ix);
-        reversalPoints = findZeroCrossings(CSD_(:,timeIndex));
+        reversalPoints = findZeroCrossings(CSD_(:,timeIndex), 0);
+        
+        % Take first reversal after max
+        if noisetype=='6'
+            reversalPoints1 = reversalPoints(reversalPoints<depthIndex);
+            reversalPoints1 = max(reversalPoints1);
+            reversalPoints2 = reversalPoints(reversalPoints>depthIndex);
+            reversalPoints2 = min(reversalPoints2);
+            reversalPoints = [reversalPoints1 reversalPoints2];
+        elseif ip.Results.sink_first
+            reversalPoints = reversalPoints(reversalPoints<depthIndex);
+            reversalPoints = max(reversalPoints);
+        else
+            reversalPoints = reversalPoints(reversalPoints<depthIndex);
+            reversalPoints = max(reversalPoints);
+        end
+        
+        depthIndex = depthIndex+1;
+%         figure()
+%         imagesc(CSD_)
         if isempty(reversalPoints)
             stats.reversalPointDepth{shankInd} = NaN;
+            stats.sinkDepth{shankInd} = NaN;
+            stats.sinkTime{shankInd} = NaN;
         else
-            stats.reversalPointDepth{shankInd} = reversalPoints(1);
+            stats.reversalPointDepth{shankInd} = ch0(reversalPoints); %reversalPoints(1);
+            stats.sinkDepth{shankInd} = ch0(depthIndex);
+            stats.sinkTime{shankInd} = sinkTime;
         end
         
         continue
@@ -279,6 +428,7 @@ for shankInd = 1:numShanks
     stats.sourceDepth(shankInd) = source;
     stats.sinkChannel(shankInd) = mn+1;
     stats.sourceChannel(shankInd) = mx+1;
+    
 end
 
 % Output
@@ -287,6 +437,7 @@ stats.chDepths = ch00;
 stats.chUp  = ch0;
 stats.depth = ch0;
 stats.numShanks = numShanks;
+
 
 if ip.Results.plotIt
     

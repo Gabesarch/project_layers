@@ -29,7 +29,7 @@ ip.addParameter('sampleRate', 1e3)
 ip.addParameter('plotIt', true)
 ip.addParameter('norm', true)
 ip.addParameter('inds', [1 100000])
-ip.addParameter('exclude', true)
+ip.addParameter('exclude', false)
 ip.parse(varargin{:});
 inds = ip.Results.inds;
 
@@ -57,6 +57,7 @@ else
     error('Wrong LFP input: see documentation')
 end
 
+data(any(isnan(data), 2), :) = [];
 p = bandpower(data,ip.Results.sampleRate,frange);
 
 if ip.Results.exclude

@@ -46,7 +46,7 @@ ip.addParameter('sampleRate', 1e3)
 ip.addParameter('plotIt', false)
 %ip.addParameter('norm', true)
 ip.addParameter('inds', [100000 200000])
-ip.addParameter('exclude', true)
+ip.addParameter('exclude', false)
 ip.addParameter('method', 'weightedMin')
 ip.parse(varargin{:});
 
